@@ -137,3 +137,11 @@ def test_count_tokens_follows_failover_order(monkeypatch, tmp_path):
     llm = LocalLLM(make_cfg(monkeypatch, tmp_path))
     mock(llm, {"primary": down, "fallback": ok("fall")})
     assert asyncio.run(llm.count_tokens("one two three four")) == 4
+
+
+def test_a_proxy_in_the_environment_never_carries_worker_traffic(monkeypatch, tmp_path):
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.setenv(var, "http://203.0.113.9:3128")
+    llm = LocalLLM(make_cfg(monkeypatch, tmp_path))
+    for b in llm.backends:
+        assert b.client.trust_env is False and not b.client._mounts

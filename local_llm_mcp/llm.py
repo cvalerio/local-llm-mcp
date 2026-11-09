@@ -69,7 +69,9 @@ class LocalLLM:
 
     def _backend(self, name: str, base_url: str, model: str, api_key: str) -> Backend:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        client = httpx.AsyncClient(base_url=base_url, headers=headers,
+        # trust_env=False: an HTTP(S)_PROXY in the environment must not carry private material off
+        # the local network to a host assert_local_endpoint never saw.
+        client = httpx.AsyncClient(base_url=base_url, headers=headers, trust_env=False,
                                    timeout=httpx.Timeout(self.cfg.llm_timeout, connect=10.0))
         return Backend(name, base_url, model, client)
 

@@ -108,25 +108,45 @@ _KIND_BY_RULE = {
 
 # Values that look like a secret assignment but are references, not secrets.
 _NOT_A_VALUE = {"none", "null", "unset", "missing", "redacted", "true", "false", "changeme", "xxx"}
-_REFERENCE_PREFIXES = ("$", "${", "os.environ", "env:", "secret://", "vault://", "<", "[", "***", "/", "~/", "./", "../", "{", "%")
+_REFERENCE_PREFIXES = ("os.environ", "env:", "secret://", "vault://", "***")
+# What a reference looks like as a WHOLE. A value that merely starts with one of these characters is
+# a password ("$3cr3t!", "/Xk29", "{abc"): a one-segment absolute path and a mixed-case "$name" count
+# as secrets, the fail-safe direction.
+_REFERENCE_RE = re.compile(
+    r"\$(?:[A-Z_][A-Z0-9_]*|[a-z_][a-z0-9_]*)|\$\{.*|\$\(.*"          # $VAR, $var, ${...}, $(...
+    r"|%[A-Za-z_][A-Za-z0-9_]*%|%\(\w+\)[sd]|%[sd]"                     # %VAR%, %(name)s, %s
+    r"|\{\{.*\}\}|\{[\w.]*\}|<.*>|\[.*\]"                            # {{ x }}, {name}, <redacted>, [masked]
+    r"|(?:~|\.{1,2})/\S*|/[\w.@-]+(?:/[\w.@-]*)+")                     # ~/x, ./x, /run/secrets/x
+_SECRET_WORDS = (r"password|passwd|passphrase|secret|api[_ -]?key|access[_ -]?token|auth[_ -]?token|"
+                 r"private[_ -]?key|client[_ -]?secret|bearer[_ -]?token|token")
 
 # (name, compiled pattern, kind, group index whose span is the value)
 _BUILTIN: list[tuple[str, re.Pattern[str], str, int]] = [
     ("pem_block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), "SECRET", 0),
-    ("pem_open", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[^\n]*"), "SECRET", 0),
+    # A block with no END in sight (cut by the material cap): its body goes with the header.
+    ("pem_open", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[^\n]*(?:\r?\n[A-Za-z0-9+/=]{16,})*"), "SECRET", 0),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"), "SECRET", 0),
     ("slack_token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"), "SECRET", 0),
     ("bearer", re.compile(r"(?i)\bbearer\s+([A-Za-z0-9._~+/=-]{16,})"), "SECRET", 1),
+    # (?<![A-Za-z0-9]) rather than \\b, so DB_PASSWORD= and --db-token= count; the closing quote of a
+    # JSON key may sit before the colon, escaped when the JSON is itself inside a string; NUL ends a
+    # value, because /proc/<pid>/environ separates its variables with it.
     ("assignment", re.compile(
-        r"(?i)\b(?:password|passwd|passphrase|secret|api[_ -]?key|access[_ -]?token|auth[_ -]?token|"
-        r"private[_ -]?key|client[_ -]?secret|bearer[_ -]?token|token)\b\s*[=:]\s*['\"]?([^\s'\"]{6,})"), "SECRET", 1),
+        rf"(?i)(?<![A-Za-z0-9])(?:{_SECRET_WORDS})\b\\?[\"']?\s*[=:]\s*\\?['\"]?([^\s'\"\x00]{{6,}})"), "SECRET", 1),
+    ("assignment_quoted", re.compile(  # a quoted value may hold spaces
+        rf"(?i)(?<![A-Za-z0-9])(?:{_SECRET_WORDS})\b[\"']?\s*[=:]\s*([\"'])((?:(?!\1)[^\n\x00]){{6,256}})\1"), "SECRET", 2),
+    ("env_secret_inline", re.compile(  # NAME=value anywhere on a line; bounded, so a long capital run stays linear
+        r"(?<![A-Za-z0-9_])[A-Z0-9_]{0,64}(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|CREDENTIAL)[A-Z0-9_]{0,64}"
+        r"\s*=\s*['\"]?([^\s'\"\x00]{6,})"), "SECRET", 1),
+    ("url_credentials", re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.-]{1,31}://[^\s/:@'\"]{0,128}:([^\s/@'\"]{1,256})@"), "SECRET", 1),
+    ("basic_auth", re.compile(r"(?i)\bauthorization\b[\"']?\s*[:=]\s*[\"']?basic\s+([A-Za-z0-9+/_-]{4,}={0,2})"), "SECRET", 1),
     # Prose form ("the password is hunter2"): only values that look like a
     # secret, so "the secret is stored" does not lose a word.
     ("assignment_prose", re.compile(
         r"(?i)\b(?:password|passwd|passphrase|api[_ -]?key|access[_ -]?token|auth[_ -]?token|"
         r"private[_ -]?key|client[_ -]?secret)\b\s+(?:is|was|=)\s*['\"]?([^\s'\"]{6,})"), "SECRET", 1),
     ("env_secret_line", re.compile(
-        r"(?im)^\s*(?:export\s+)?[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|CREDENTIAL)[A-Z0-9_]*\s*=\s*['\"]?([^\s'\"#]{6,})"), "SECRET", 1),
+        r"(?im)^\s*(?:export\s+)?[A-Z0-9_]{0,64}(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|CREDENTIAL)[A-Z0-9_]{0,64}\s*=\s*['\"]?([^\s'\"#]{6,})"), "SECRET", 1),
     ("aws_key", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"), "SECRET", 0),
     ("github_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"), "SECRET", 0),
     ("openai_style_key", re.compile(r"\b(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}\b"), "SECRET", 0),
@@ -333,7 +353,7 @@ def _is_reference(value: str) -> bool:
         return True
     if _ENV_NAME_RE.fullmatch(v):
         return True  # "SECRET: TELEGRAM_BOT_TOKEN" names a variable; it is not its value
-    if v.startswith(_REFERENCE_PREFIXES) or re.match(r"^[A-Za-z]:[\\/]", v):
+    if v.startswith(_REFERENCE_PREFIXES) or _REFERENCE_RE.fullmatch(v) or re.match(r"^[A-Za-z]:[\\/]", v):
         return True
     if PLACEHOLDER_RE.fullmatch(v):
         return True
@@ -835,8 +855,12 @@ class Scrubber:
         return counts
 
     def scrub(self, text: str, vault: Vault, *, secrets_only: bool = False,
-              policy: Policy | None = None) -> ScrubResult:
-        """Replace every detectable value AND every vault value the policy masks with placeholders."""
+              policy: Policy | None = None, keep_lines: bool = False) -> ScrubResult:
+        """Replace every detectable value AND every vault value the policy masks with placeholders.
+
+        ``keep_lines``: a masked value that spanned several lines leaves that many line breaks behind
+        its placeholder, so line N of the result is line N of the input (slices and verbatim quotes
+        are cut from the scrubbed text by line number)."""
         if not text:
             return ScrubResult(text, 0, {})
         text = _NESTED_PLACEHOLDER_RE.sub(r"\2", text)  # "[CARD-[CARD-1]]" from an earlier pass or a worker
@@ -870,7 +894,7 @@ class Scrubber:
                 continue
             out.append(text[pos:s])
             ph = self.placeholder(vault, kind, value)
-            out.append(ph)
+            out.append(ph + ("\n" * text.count("\n", s, e) if keep_lines else ""))
             replaced += 1
             kinds[kind] = kinds.get(kind, 0) + 1
             pos = e
@@ -886,7 +910,7 @@ class Scrubber:
                 if s < pos:
                     continue
                 out.append(result[pos:s])
-                out.append("[REDACTED]")
+                out.append("[REDACTED]" + ("\n" * result.count("\n", s, e) if keep_lines else ""))
                 replaced += 1
                 kinds[kind] = kinds.get(kind, 0) + 1
                 pos = e

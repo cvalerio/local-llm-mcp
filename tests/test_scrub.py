@@ -641,3 +641,55 @@ def test_term_matching_and_rehydration_are_linear_on_1mb(every_format, tmp_path,
     full, spans = cost(1_000_000)
     assert spans == [] and full < 10.0, (shape, full)
     assert full < 3 * half + 0.05, (shape, half, full)  # linear doubles; quadratic would quadruple
+
+
+@pytest.mark.parametrize("text, secret", [
+    ('{"password": "hunter2secret"}', "hunter2secret"),
+    ('{"api_key":"abcd1234value"}', "abcd1234value"),
+    ('{"password": "three word phrase"}', "three word phrase"),
+    ('{\\"password\\":\\"hunter2secret\\"}', "hunter2secret"),
+    ("docker run -e DB_PASSWORD=S3cretValue123 img", "S3cretValue123"),
+    ("FOO=1 MY_API_TOKEN=abcdef123456 cmd", "abcdef123456"),
+    ("run AWS_SECRET_ACCESS_KEY=abc123def456 x", "abc123def456"),
+    ("A=1\0GITHUB_TOKEN=abcdef123456\0B=2\0", "abcdef123456"),
+    ("A=1\0LOCAL_LLM_MCP_API_KEY=zzz123456\0", "zzz123456"),
+    ("postgres://app:p4ssw0rd@dbhost:5432/db", "p4ssw0rd"),
+    ("redis://:p4ssw0rd@cache:6379/0", "p4ssw0rd"),
+    ("Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA=="),
+    ("password=$3cr3tValue!", "$3cr3tValue!"),
+    ("password: /Xk29sjabc", "/Xk29sjabc"),
+    ("password={abc12345", "{abc12345"),
+])
+def test_common_secret_shapes_are_masked(scrubber, vault, text, secret):
+    assert secret not in scrubber.scrub(text, vault, secrets_only=True).text
+
+
+def test_a_nul_separated_environment_keeps_its_other_variables(scrubber, vault):
+    out = scrubber.scrub("HOME=/srv/app\0GITHUB_TOKEN=abcdef123456\0LANG=C\0", vault, secrets_only=True).text
+    assert "HOME=/srv/app\0" in out and "\0LANG=C\0" in out
+
+
+@pytest.mark.parametrize("text", [
+    "password = $DB_PASS", "password = $db_pass", "token=${VAULT_TOKEN}", "secret: $(cat /run/key)", "password: %DB_PASS%",
+    "password = {{ vault_db }}", "password={password}", "TOKEN=<redacted>", "password_file: /run/secrets/db",
+    "password: /run/secrets/db", "api_key: ~/keys/service", "https://example.org:8443/path@v2", "a basic setup is fine",
+])
+def test_references_and_lookalikes_stay_readable(scrubber, vault, text):
+    assert scrubber.scrub(text, vault, secrets_only=True).text == text
+
+
+def test_a_pem_cut_before_its_end_loses_its_body_too(scrubber, vault):
+    out = scrubber.scrub("-----BEGIN PRIVATE KEY-----\nMIIEFAKEbodyline1AAAA\nMIIEFAKEbodyline2BBBB\n", vault, secrets_only=True).text
+    assert "MIIEFAKE" not in out
+
+
+def test_keep_lines_leaves_the_line_count_alone(scrubber, vault):
+    text = "a\n-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\nz"
+    out = scrubber.scrub(text, vault, secrets_only=True, keep_lines=True).text
+    assert out.count("\n") == text.count("\n") and out.split("\n")[-1] == "z"
+
+
+def test_a_long_capital_run_stays_fast(scrubber, vault):
+    t0 = time.monotonic()
+    scrubber.find_spans("KEY_" * 50_000, secrets_only=True)
+    assert time.monotonic() - t0 < 5

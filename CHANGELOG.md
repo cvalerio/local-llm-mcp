@@ -4,6 +4,21 @@ All notable changes to local-llm-mcp. Dates are the day the change was pushed.
 
 ## Unreleased
 
+### Fixed — secrets, the allow list and the worker's route (security review)
+- **A slice no longer shows part of a secret.** `local_llm_artifact` and `verbatim=true` cut from the raw material and
+  scrubbed afterwards, and a scrub cannot recognise a fragment: a slice starting inside a private key returned its body.
+  Both now scrub the whole material first and cut from the result. Line numbers are unchanged, since a masked multi-line
+  value leaves its line breaks behind; **character offsets of `local_llm_artifact` now count the scrubbed text.** The
+  stored excerpt is cut after the scrub too, and a private key with no END line loses its body with its header.
+- **More secret shapes are masked:** JSON keys (`"password": "..."`, also escaped, also with spaces in the value),
+  `NAME_PASSWORD=...` anywhere on a line, NUL-separated environments (`/proc/<pid>/environ`), passwords in URLs and
+  `Authorization: Basic`. A value is treated as a reference only if all of it looks like one, so `$3cr3t!`, `/Xk29` and
+  `{abc` are now masked while `$VAR`, `${VAR}`, `{{ x }}` and `/run/secrets/x` stay readable.
+- **The command policy reads inside double quotes.** Bash runs `$(...)` and backticks there, but they were not segments:
+  `ls "$(sudo id)"` passed an allow entry for `ls*` and no deny shape saw `sudo`. They are now judged as commands.
+- **Worker traffic ignores proxy variables.** `httpx` honoured `HTTP(S)_PROXY`, which could route private material off the
+  local network past the endpoint check.
+
 ### Fixed — the git gate refuses a LAN host written by its last octet
 - `tools/publiccheck.py` has a new shape check, `short host address`: a dot and two or three digits written the way
   prose names a host (after whitespace, an opening bracket or quote, or the start of a line; a port or a possessive may

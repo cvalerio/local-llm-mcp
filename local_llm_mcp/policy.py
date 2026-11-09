@@ -112,10 +112,48 @@ class RunChoice(BaseModel):
 # --------------------------------------------------------------------------- parsing
 
 
+def _substitution_end(command: str, start: int) -> int:
+    """Index of the character closing the ``$(`` or backtick at ``start``; ``len(command)`` when it
+    is never closed, so an unterminated substitution is judged to the end of the line."""
+    n = len(command)
+    if command[start] == "`":
+        i = start + 1
+        while i < n:
+            if command[i] == "\\":
+                i += 2
+                continue
+            if command[i] == "`":
+                return i
+            i += 1
+        return n
+    depth, quote, i = 1, "", start + 2
+    while i < n:
+        c = command[i]
+        if c == "\\" and quote != "'":
+            i += 2
+            continue
+        if quote:
+            if c == quote:
+                quote = ""
+        elif c in "'\"":
+            quote = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if not depth:
+                return i
+        i += 1
+    return n
+
+
 def split_segments(command: str) -> list[str]:
     """Split a command line on the shell operators that start a NEW command — ``;``, ``&&``,
     ``||``, ``|``, ``&`` and newline — respecting quotes, so ``grep 'a|b' x`` stays one segment.
-    Subshell punctuation is dropped. Every segment is judged on its own."""
+    Subshell punctuation is dropped. Every segment is judged on its own.
+
+    Double quotes do not stop bash from running a ``$(...)`` or a backtick command inside them, so
+    those commands are segments too: ``ls "$(sudo id)"`` is judged as ``ls …`` AND ``sudo id``."""
     out: list[str] = []
     buf: list[str] = []
     quote = ""
@@ -128,6 +166,12 @@ def split_segments(command: str) -> list[str]:
             if c == "\\" and quote == '"' and i + 1 < n:
                 buf.append(command[i + 1])
                 i += 2
+                continue
+            if quote == '"' and (c == "`" or command.startswith("$(", i)):
+                end = _substitution_end(command, i)
+                out.extend(split_segments(command[i + (1 if c == "`" else 2):end]))
+                buf.append(command[i + 1:end + 1])  # kept whole: its quotes must not end this string
+                i = end + 1
                 continue
             if c == quote:
                 quote = ""
@@ -410,11 +454,14 @@ def check(command: str, allow: AllowList | None = None, secrets: Iterable[str] =
                         f"{', '.join(leaked)} stands for a secret, and a secret is never handed to a shell. "
                         "Ask the user to run this themselves, or use a form of the command that reads the "
                         "secret from a file or the environment.")
-    for text in (command,) if not expanded or expanded == command else (command, expanded):
-        label, reason, segment = deny_reason(text)
-        if label:
-            return Decision("deny", label, reason, segment if text == command else "")
-    glob = allow.matches(command) if allow else ""
+    try:
+        for text in (command,) if not expanded or expanded == command else (command, expanded):
+            label, reason, segment = deny_reason(text)
+            if label:
+                return Decision("deny", label, reason, segment if text == command else "")
+        glob = allow.matches(command) if allow else ""
+    except RecursionError:  # substitutions nested past what can be read are not approved unread
+        return Decision("deny", "nesting", "this command nests substitutions too deeply to be judged")
     if glob:
         return Decision("allow", glob)
     return Decision("ask")

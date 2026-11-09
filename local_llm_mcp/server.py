@@ -31,7 +31,7 @@ from .llm import LLMError, LocalLLM
 from .material import ShellNotFound, cap, read_paths, run_command
 from .observers import load_observer
 from . import policy as cp
-from .scrub import TIERS, Policy, ScrubResult, Scrubber
+from .scrub import PLACEHOLDER_RE, TIERS, Policy, ScrubResult, Scrubber
 from .session import Session
 from . import verbatim as vb
 
@@ -80,9 +80,9 @@ class App:
         """What may leave in clear right now: the mode plus this session's disclosure state."""
         return self.session.disclosure.policy(self.mode)
 
-    def outbound(self, text: str, policy: Policy | None = None) -> ScrubResult:
+    def outbound(self, text: str, policy: Policy | None = None, *, keep_lines: bool = False) -> ScrubResult:
         """Everything that leaves the server passes through here."""
-        return self.scrubber.scrub(text, self.session.vault, policy=policy or self.policy())
+        return self.scrubber.scrub(text, self.session.vault, policy=policy or self.policy(), keep_lines=keep_lines)
 
     def vault_memory(self) -> int:
         """When a session moves to PII mode (or identity values get masked): values already
@@ -287,8 +287,8 @@ class App:
     def _trailer(parts: list[str]) -> str:
         return "\n\n— local-llm · " + " · ".join(p for p in parts if p)
 
-    async def locate_and_quote(self, task: str, material: str, source: str, max_output_chars: int) -> tuple[str, list]:
-        """Verbatim mode: ask the worker for line ranges per chunk, quote them exactly."""
+    async def locate_lines(self, task: str, material: str, source: str) -> list[tuple[int, int]]:
+        """Verbatim mode: ask the worker for the line ranges the task refers to, chunk by chunk."""
         lines = material.split("\n")
         total = len(lines)
         windows = vb.chunk_lines(lines, self.cfg.chunk_chars)
@@ -305,12 +305,16 @@ class App:
                 return vb.parse_ranges(text, total)
 
         found = await asyncio.gather(*(one(a, b) for a, b in windows))
-        ranges = vb.merge_ranges([r for part in found for r in part], total)
+        return vb.merge_ranges([r for part in found for r in part], total)
+
+    def quote_lines(self, material: str, ranges: list[tuple[int, int]], source: str, max_output_chars: int,
+                    policy: Policy) -> tuple[str, list]:
+        """Quote the ranges from the SCRUBBED material: a range that starts inside a multi-line secret
+        holds only a fragment of it, and no scrub can recognise a fragment afterwards."""
         if not ranges:
             return "", []  # nothing to quote: the caller falls back to a digest
         label = source if not source.startswith(("paths:", "inline")) and ";" not in source else f"combined material ({source})"
-        text, left = vb.quote(lines, ranges, label, max_output_chars)
-        return text, left
+        return vb.quote(self.outbound(material, policy, keep_lines=True).text.split("\n"), ranges, label, max_output_chars)
 
     def _measure(self, turn: dict, gathered_text: str, returned_text: str) -> None:
         """Record the turn in the savings ledger with the worker's exact token counts,
@@ -382,7 +386,7 @@ class App:
             left_out: list = []
             # The worker starts now; a disclosure dialog, if one is due, runs while it works.
             if verbatim and material:
-                work = asyncio.ensure_future(self.locate_and_quote(self.inbound(task), material, source, max_output_chars))
+                work = asyncio.ensure_future(self.locate_lines(self.inbound(task), material, source))
             else:
                 work = asyncio.ensure_future(self.llm.digest(
                     system, self.inbound(task), material, source,
@@ -400,7 +404,9 @@ class App:
                 mode = self.mode  # a switch to PII lands here
             try:
                 if verbatim and material:
-                    answer, left_out = await work
+                    # quoted only now: a disclosure dialog may have just decided what can be shown
+                    answer, left_out = self.quote_lines(material, await work, source, max_output_chars,
+                                                        override or self.policy())
                     usage = None
                     if not answer:
                         # A locate pass that matches nothing almost always means the task was a
@@ -436,7 +442,7 @@ class App:
                     scrubbed = self.outbound(scrubbed.text, policy)
             # What the worker SAW is part of its memory too, not only what it said —
             # bounded, and scrubbed like everything else that is written down.
-            excerpt = self.outbound(material[:self.cfg.excerpt_chars], policy).text if material else ""
+            excerpt = self.outbound(material, policy).text[:self.cfg.excerpt_chars] if material else ""  # scrub, then cut
             turn = {
                 "kind": kind, "mode": mode, "task": task[:2000], "source": source[:300], "excerpt": excerpt,
                 "verbatim": verbatim,
@@ -507,12 +513,37 @@ class App:
         is masked — the answer pass over the slice itself, so a bare name deep in a large file that no
         answer ever mentioned cannot leave through this channel. Returns (scrubbed, trailer note)."""
         scrubbed = self.outbound(piece)
-        if not scrubbed.text or not self.identity_masked():
-            return scrubbed, ""
-        found, ran = await self.answer_pass(scrubbed.text)
-        if found:
-            scrubbed = self.outbound(scrubbed.text)
-        return scrubbed, ("leak-check ok" if ran else "leak-check FAILED (deterministic layers only)")
+        note = ""
+        if scrubbed.text and self.identity_masked():
+            found, ran = await self.answer_pass(scrubbed.text)
+            if found:
+                scrubbed = self.outbound(scrubbed.text)
+            note = "leak-check ok" if ran else "leak-check FAILED (deterministic layers only)"
+        # The piece was cut from scrubbed text, so what it masks is counted from its placeholders.
+        kinds: dict[str, int] = {}
+        for m in PLACEHOLDER_RE.finditer(scrubbed.text):
+            kinds[m.group("kind")] = kinds.get(m.group("kind"), 0) + 1
+        return ScrubResult(scrubbed.text, sum(kinds.values()), kinds), note
+
+    async def artifact_slice(self, ref: str, offset: int, limit: int, line_start: int, line_end: int) -> str:
+        """An exact slice of stored material, cut AFTER the whole of it is scrubbed: a slice that starts
+        inside a secret holds only a fragment, and no scrub can recognise a fragment afterwards. Lines
+        keep their numbers; character offsets count the scrubbed text."""
+        raw = self.session.read_artifact(ref)
+        if raw is None:
+            return f"Error: no artifact {ref} in this session (refs are per conversation; see local_llm_status)."
+        clean = self.outbound(raw, keep_lines=True).text
+        if line_start > 0:
+            lines = clean.split("\n")
+            end = min(len(lines), line_end or line_start + 199)
+            piece = vb.number_lines(lines[line_start - 1:end], line_start) if line_start <= len(lines) else ""
+            scrubbed, leak = await self.outbound_slice(piece)
+            return scrubbed.text + self._trailer([f"artifact {ref}", f"lines {line_start}-{end} of {len(lines)}",
+                                                  f"next line {end + 1}" if end < len(lines) else "end", leak, scrubbed.trailer()])
+        scrubbed, leak = await self.outbound_slice(clean[offset:offset + limit])
+        return scrubbed.text + self._trailer([f"artifact {ref}", f"chars {offset}-{min(offset + limit, len(clean))} of {len(clean)}",
+                                              f"next offset {offset + limit}" if offset + limit < len(clean) else "end",
+                                              leak, scrubbed.trailer()])
 
     async def entity_pass(self, material: str) -> int:
         """Ask the worker what private values the material holds; register them.
@@ -831,7 +862,7 @@ def build(cfg: Config) -> FastMCP:
             "Return an exact slice of the raw material behind an earlier result, by its artifact ref (a_xxxxxxxx from a "
             "trailer): by line (line_start/line_end, numbered) or by character (offset/limit). Use when the digest left "
             "out something you need exactly. In PII mode the slice is scrubbed (placeholders); in ASSIST mode only "
-            "secrets are scrubbed."),
+            "secrets are scrubbed. Line numbers are those of the raw material; character offsets count the scrubbed text."),
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
     )
     async def local_llm_artifact(
@@ -846,23 +877,7 @@ def build(cfg: Config) -> FastMCP:
         on, note = await a.ensure_armed(ctx, "local_llm_artifact")
         if not on:
             return note
-        raw = a.session.read_artifact(ref)
-        if raw is None:
-            return f"Error: no artifact {ref} in this session (refs are per conversation; see local_llm_status)."
-        if line_start > 0:
-            lines = raw.split("\n")
-            end = min(len(lines), line_end or line_start + 199)
-            piece = vb.number_lines(lines[line_start - 1:end], line_start) if line_start <= len(lines) else ""
-            scrubbed, leak = await a.outbound_slice(piece)
-            trailer = App._trailer([f"artifact {ref}", f"lines {line_start}-{end} of {len(lines)}",
-                                    f"next line {end + 1}" if end < len(lines) else "end", leak, scrubbed.trailer()])
-            return scrubbed.text + trailer
-        piece = raw[offset:offset + limit]
-        scrubbed, leak = await a.outbound_slice(piece)
-        has_more = offset + limit < len(raw)
-        trailer = App._trailer([f"artifact {ref}", f"chars {offset}-{min(offset + limit, len(raw))} of {len(raw)}",
-                                f"next offset {offset + limit}" if has_more else "end", leak, scrubbed.trailer()])
-        return scrubbed.text + trailer
+        return await a.artifact_slice(ref, offset, limit, line_start, line_end)
 
     @mcp.tool(
         name="local_llm_status",

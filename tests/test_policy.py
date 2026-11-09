@@ -260,3 +260,33 @@ def test_an_unknown_run_policy_is_refused_at_startup(monkeypatch):
     monkeypatch.setenv("LOCAL_LLM_MCP_RUN_POLICY", "sometimes")
     with pytest.raises(ConfigError):
         Config.from_env()
+
+
+# ---- commands inside double quotes still run ----------------------------------------
+
+
+@pytest.mark.parametrize("command", ['ls "$(sudo id)"', 'ls "`sudo id`"', 'ls "a $(echo "b" && sudo id) c"', 'ls "$(echo "$(sudo id)")"'])
+def test_a_denied_command_inside_double_quotes_is_denied(command):
+    assert cp.check(command, None).verdict == "deny"
+
+
+def test_a_substitution_inside_double_quotes_must_be_on_the_allow_list_too(tmp_path):
+    allow = cp.AllowList(tmp_path / "allow.txt")
+    allow.add("ls*")
+    assert cp.check('ls "$(whoami)"', allow).verdict == "ask"
+    allow.add("whoami*")
+    assert cp.check('ls "$(whoami)"', allow).verdict == "allow"
+
+
+def test_an_unterminated_substitution_is_judged_to_the_end():
+    assert cp.check('ls "$(sudo id', None).verdict == "deny"
+
+
+def test_what_bash_does_not_run_stays_one_segment():
+    assert cp.split_segments("""grep '$(sudo id)' f""") == ["""grep '$(sudo id)' f"""]
+    assert cp.split_segments(r'echo "\$(sudo id)"') == [r'echo "\$(sudo id)"']
+
+
+def test_substitutions_nested_past_reading_are_refused():
+    d = cp.check('ls ' + '"$(' * 5000, None)
+    assert d.verdict == "deny" and d.rule == "nesting"

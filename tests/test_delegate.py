@@ -45,12 +45,12 @@ def run(app: App, **kw) -> str:
 def test_verbatim_quotes_when_lines_match(monkeypatch, tmp_path):
     app = make_app(monkeypatch, tmp_path)
 
-    async def locate(task, material, source, max_output_chars):
-        return "2: beta", []
-    app.locate_and_quote = locate
+    async def locate(task, material, source):
+        return [(2, 2)]
+    app.locate_lines = locate
     out = run(app, kind="run", task="the beta line", material="alpha\nbeta\ngamma\n", source="command: x",
               max_output_chars=500, verbatim=True)
-    assert out.startswith("2: beta") and "· verbatim" in out and "digested instead" not in out
+    assert "\n2: beta" in out and "· verbatim" in out and "digested instead" not in out
     turn = app.session.turns()[-1]
     assert turn["verbatim"] is True and "verbatim_fallback" not in turn
 
@@ -58,9 +58,9 @@ def test_verbatim_quotes_when_lines_match(monkeypatch, tmp_path):
 def test_verbatim_with_no_match_is_digested_instead(monkeypatch, tmp_path):
     app = make_app(monkeypatch, tmp_path)
 
-    async def locate(task, material, source, max_output_chars):
-        return "", []
-    app.locate_and_quote = locate
+    async def locate(task, material, source):
+        return []
+    app.locate_lines = locate
     out = run(app, kind="run", task="How many lines?", material="alpha\nbeta\ngamma\n", source="command: x",
               max_output_chars=500, verbatim=True)
     assert out.startswith("digested: How many lines? over 17 chars")
@@ -197,3 +197,52 @@ def test_artifact_slice_gets_the_answer_pass_and_failures_are_counted(monkeypatc
     assert note3.startswith("leak-check FAILED") and app.session.leak_check()["failed"] == 1 and app.session.leak_check()["ran"] == 2
     assert app.session.leak_check()["last_failure"]["error"] == "worker down"
     assert app.session.status()["leak_check"]["failed"] == 1
+
+
+# ---- a slice is cut from scrubbed text ----------------------------------------------
+
+PEM = "-----BEGIN RSA PRIVATE KEY-----\nMIIEFAKEbodyline1AAAAAAAA\nMIIEFAKEbodyline2BBBBBBBB\n-----END RSA PRIVATE KEY-----"
+TOKEN = "ghp_" + "a1B2" * 8
+RAW = "header\n" + PEM + "\n" + TOKEN + "\nlast line\n"
+
+
+def stored(monkeypatch, tmp_path):
+    app = make_app(monkeypatch, tmp_path)
+
+    async def chat(system, user, *, max_tokens, temperature=0.2):
+        return "[]", {}
+    app.llm.chat = chat
+    return app, app.session.store_artifact(RAW, {"kind": "run"})
+
+
+def test_a_line_slice_inside_a_private_key_shows_none_of_it(monkeypatch, tmp_path):
+    app, ref = stored(monkeypatch, tmp_path)
+    out = asyncio.run(app.artifact_slice(ref, 0, 4000, 3, 4))
+    assert "MIIEFAKE" not in out
+
+
+def test_line_numbers_survive_a_masked_multi_line_secret(monkeypatch, tmp_path):
+    app, ref = stored(monkeypatch, tmp_path)
+    out = asyncio.run(app.artifact_slice(ref, 0, 4000, 7, 7))  # line 7 of RAW, after the four PEM lines and the token
+    assert out.startswith("7: last line") and "lines 7-7 of 8" in out
+
+
+def test_a_character_slice_starting_inside_a_token_shows_none_of_it(monkeypatch, tmp_path):
+    app, ref = stored(monkeypatch, tmp_path)
+    clean_start = asyncio.run(app.artifact_slice(ref, 0, 4000, 0, 0))
+    assert TOKEN not in clean_start and "[SECRET-" in clean_start and "scrubbed" in clean_start
+    for offset in range(0, len(clean_start), 3):
+        assert TOKEN[8:24] not in asyncio.run(app.artifact_slice(ref, offset, 100, 0, 0))
+
+
+def test_a_verbatim_range_inside_a_private_key_quotes_none_of_it(monkeypatch, tmp_path):
+    app = make_app(monkeypatch, tmp_path)
+
+    async def locate(task, material, source):
+        return [(3, 4)]
+
+    async def chat(system, user, *, max_tokens, temperature=0.2):
+        return "[]", {}
+    app.locate_lines, app.llm.chat = locate, chat
+    out = run(app, kind="run", task="the key", material=RAW, source="command: x", max_output_chars=500, verbatim=True)
+    assert "MIIEFAKE" not in out and "· verbatim" in out
