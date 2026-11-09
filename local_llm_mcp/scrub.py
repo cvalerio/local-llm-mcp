@@ -13,7 +13,8 @@ Detection is layered, and every layer is deterministic:
 * **identity shapes** (PII mode only) — things that identify a person by their
   SHAPE alone, with no seed data: street addresses and PO boxes, ``City, ST 12345``,
   names introduced by an honorific, a form label, a mail header, a greeting or a
-  sign-off, dates of birth, labelled account and identity numbers;
+  sign-off, dates of birth, labelled account and identity numbers — in English and
+  in Italian (codice fiscale, partita IVA, ``Via Roma 12``, ``Sig.ra``, ``+39``);
 * **private terms** — the operator's own literal names, addresses and numbers
   from a terms file, because an unlabelled name has no shape;
 * **entities the worker found** — in PII mode the worker model is asked what
@@ -145,6 +146,9 @@ _BUILTIN: list[tuple[str, re.Pattern[str], str, int]] = [
     ("assignment_prose", re.compile(
         r"(?i)\b(?:password|passwd|passphrase|api[_ -]?key|access[_ -]?token|auth[_ -]?token|"
         r"private[_ -]?key|client[_ -]?secret)\b\s+(?:is|was|=)\s*['\"]?([^\s'\"]{6,})"), "SECRET", 1),
+    ("assignment_prose_it", re.compile(
+        r"(?i)\b(?:password|passwd|parola\s+d['’]ordine|api[_ -]?key|chiave\s+api|token|segreto|pin)\b\s+"
+        r"(?:è|e'|era|sarebbe)\s*['\"]?([^\s'\"]{4,})"), "SECRET", 1),
     ("env_secret_line", re.compile(
         r"(?im)^\s*(?:export\s+)?[A-Z0-9_]{0,64}(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|CREDENTIAL)[A-Z0-9_]{0,64}\s*=\s*['\"]?([^\s'\"#]{6,})"), "SECRET", 1),
     ("aws_key", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"), "SECRET", 0),
@@ -186,12 +190,31 @@ _UNIT = r"(?:,?\s*(?:Apt|Apartment|Suite|Ste|Unit|Floor|Fl|Bldg|Building|Room|Rm
 # "no. 123" · "#123" · "number 123" · ": 123" · '": "123'
 _LABEL_SEP = r"(?:\s*(?i:#|no\.?|number|num\.?)\s*[:=]?|\"?\s*[:=])\s*\"?"
 _MONTH = (r"(?i:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|"
-          r"sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
+          r"sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|"
+          r"gennaio|gen|febbraio|marzo|aprile|maggio|mag|giugno|giu|luglio|lug|agosto|ago|settembre|set|ottobre|ott|novembre|dicembre|dic)")
 _DATE = (r"(?:\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}-\d{2}-\d{2}"
          rf"|\d{{1,2}}(?:st|nd|rd|th)?\s+{_MONTH}\.?,?\s+\d{{4}}|{_MONTH}\.?\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}})")
 _NOT_A_GREETING = (r"(?!(?:Sir|Madam|Team|All|Everyone|Everybody|Customer|Friend|Friends|Colleagues|Support|Sirs|"
                    r"There|Both|Folks|User|Users|Admin|Guest|Guests|World)\b)")
 _ID_VALUE = r"([A-Z0-9][A-Z0-9 -]{3,30}[A-Z0-9])\b"
+
+# Italian. Same layer, same rules: a civic number is required before "via" counts as a street, and the
+# short professional titles need their dot, so "Arch Linux" and "Rag Pipeline" keep their names.
+_IT_LOWER = "a-zàèéìòù'’"
+_IT_NAME_WORD = rf"[A-ZÀÈÉÌÒÙ][{_IT_LOWER}]{{1,24}}(?:-[A-Za-z][{_IT_LOWER}]{{1,24}})?"
+_IT_NAME1 = rf"{_IT_NAME_WORD}(?:\s+(?:[A-Z]\.\s+)?{_IT_NAME_WORD}){{0,2}}"  # 1-3 words
+_IT_NAME2 = rf"{_IT_NAME_WORD}(?:\s+(?:[A-Z]\.\s+)?{_IT_NAME_WORD}){{1,3}}"  # 2-4 words
+_IT_LINK = r"(?:(?:di|de|del|della|dello|dei|degli|delle)\s+|d(?:ell)?['’]\s*)?"
+_IT_STREET_NAME = (rf"{_IT_LINK}(?:(?:[IVXLC]{{1,6}}|\d{{1,2}})\s+)?{_IT_NAME_WORD}"  # "XX Settembre", "4 Novembre"
+                   rf"(?:\s+{_IT_LINK}{_IT_NAME_WORD}){{0,4}}")
+_IT_CIVIC = r",?\s*(?:n\.?°?\s*|civico\s+)?\d{1,5}(?:/?[A-Za-z]\b|/\d{1,3})?"
+_IT_PLACE = rf"{_IT_NAME_WORD}(?:[ \t]+{_IT_NAME_WORD}){{0,3}}"
+_IT_LOCALITY = rf"(?:,?\s*(?:[-–]\s*)?\d{{5}}[ \t]+{_IT_PLACE}(?:[ \t]*\([A-Z]{{2}}\)|[ \t]+[A-Z]{{2}}\b)?)?"
+_IT_LABEL_SEP = r"(?:\s*(?i:#|n\.?°?|nr\.?|num\.?|numero)\s*[:=]?|\"?\s*[:=])\s*\"?"
+_IT_ID_SEP = rf"(?:{_IT_LABEL_SEP}|\s+)"
+_IT_NOT_A_GREETING = (r"(?!(?:Tutti|Tutte|Signori|Signore|Signora|Signor|Sig|Clienti|Cliente|Utente|Utenti|Colleghi|Colleghe|"
+                      r"Amici|Amiche|Team|Dottore|Dottoressa|Professore|Professoressa|Direttore|Responsabile)\b)")
+_OMO = r"[\dLMNPQRSTUV]"  # a digit, or the letter that replaces it in a codice fiscale's homocode
 
 # (name, pattern, kind, value group, value must contain a digit, triggers, anchored)
 # The case-insensitive label alternations are what cost time, so a labelled
@@ -228,7 +251,7 @@ _IDENTITY: list[tuple[str, re.Pattern[str], str, int, bool, tuple[_Trigger, ...]
         + _NAME1 + r")\b"), "PERSON", 1, False,
      ("first", "last", "given", "family", "middle", "maiden", "surname", "forename", "nickname"), True),
     ("mail_header_name", re.compile(
-        rf"(?m)^[ \t]*(?i:From|To|Cc|Bcc|Reply-To)\s*:\s*\"?({_NAME2})\"?\s*(?=<|,|$)"), "PERSON", 1, False, (), False),
+        rf"(?m)^[ \t]*(?i:From|To|Cc|Bcc|Reply-To|Da|A|Per|Ccn)\s*:\s*\"?({_IT_NAME2})\"?\s*(?=<|,|$)"), "PERSON", 1, False, (), False),
     ("greeting_name", re.compile(
         rf"(?m)\b(?:Dear|Hi|Hello|Hey|Good\s+(?:morning|afternoon|evening))[ ,]+{_NOT_A_GREETING}({_NAME1})"
         r"(?=\s*[,!.:;—–-]|\s*$)"), "PERSON", 1, False, ("dear", "hi", "hello", "hey", "good"), True),
@@ -253,7 +276,73 @@ _IDENTITY: list[tuple[str, re.Pattern[str], str, int, bool, tuple[_Trigger, ...]
         r"employee\s+id|student\s+id|patient\s+id|mrn|vin))\b" + _LABEL_SEP + _ID_VALUE), "ID", 1, True,
      ("passport", "driver", "driving", "national", "ni ", "nhs", "medicare", "medicaid", "tax", "itin", "member",
       "policy", "claim", "employee", "student", "patient", "mrn", "vin"), True),
+    # ---- Italian
+    ("codice_fiscale", re.compile(
+        rf"\b(?i:[A-Z]{{6}}{_OMO}{{2}}[A-EHLMPRST]{_OMO}{{2}}[A-Z]{_OMO}{{3}}[A-Z])\b"), "ID", 0, False, (), False),
+    ("partita_iva", re.compile(r"(?i:\b(?:p\.?\s?iva|partita\s+iva))\b\"?\s*[:=]?\s*\"?((?:IT\s?)?\d{11})\b"), "ID", 1, False,
+     ("p.iva", "p. iva", "piva", "p iva", "partita"), True),
+    ("it_street", re.compile(
+        r"\b(?i:via|viale|v\.le|piazza|p\.zza|piazzale|corso|c\.so|largo|vicolo|strada|contrada|localit[aà]|borgo|lungomare|"
+        rf"salita|traversa)\.?\s+{_IT_STREET_NAME}{_IT_CIVIC}{_IT_LOCALITY}"), "ADDRESS", 0, False,
+     ("via", "viale", "v.le", "piazza", "p.zza", "corso", "c.so", "largo", "vicolo", "strada", "contrada", "localit", "borgo",
+      "lungomare", "salita", "traversa"), True),
+    ("it_cap_city", re.compile(rf"\b\d{{5}}[ \t]+{_IT_PLACE}[ \t]*\([A-Z]{{2}}\)"), "ADDRESS", 0, False,
+     (re.compile(r"\([A-Z]{2}\)"),), False),
+    ("it_honorific_name", re.compile(
+        r"\b(?:Sig\.ra|Sig\.na|Sig(?:\.|nor|nora)?|Dott\.ssa|Dott\.?|Dr\.ssa|Prof\.ssa|Ing\.|Avv\.|Arch\.|Geom\.|Rag\.)\s+"
+        rf"({_IT_NAME1})\b"), "PERSON", 1, False,
+     ("sig", "dott", "dr.ssa", "prof.ssa", "ing.", "avv.", "arch.", "geom.", "rag."), True),
+    ("it_labelled_name", re.compile(
+        r"(?i:\b(?:nome\s+e\s+cognome|cognome\s+e\s+nome|nominativo|intestatari[oa]|cliente|paziente|titolare|mittente|"
+        r"destinatari[oa]|beneficiari[oa]|referente|dipendente|inquilin[oa]|conducente)\b)\"?\s*[:=]\s*\"?(" + _IT_NAME2 + r")\b"),
+     "PERSON", 1, False,
+     ("nome", "cognome", "nominativo", "intestatari", "cliente", "paziente", "titolare", "mittente", "destinatari", "beneficiari",
+      "referente", "dipendente", "inquilin", "conducente"), True),
+    ("it_labelled_name_part", re.compile(r"(?i:\b(?:nome|cognome)\b)\"?\s*[:=]\s*\"?(" + _IT_NAME1 + r")\b"), "PERSON", 1, False,
+     ("nome", "cognome"), True),
+    ("it_greeting_name", re.compile(
+        r"(?m)\b(?:Gentil(?:e|issim[oa])|Gent\.(?:mo|ma|mi)?|Egregi[oa]|Egr\.|Car[oa]|Ciao|Buongiorno|Buonasera)[ ,]+"
+        rf"{_IT_NOT_A_GREETING}({_IT_NAME1})(?=\s*[,!.:;—–-]|\s*$)"), "PERSON", 1, False,
+     ("gentil", "gent.", "egregi", "egr.", "caro", "cara", "ciao", "buongiorno", "buonasera"), True),
+    ("it_signoff_name", re.compile(
+        r"(?m)^[ \t]*(?i:cordiali\s+saluti|distinti\s+saluti|saluti|un\s+saluto|cordialmente|grazie(?:\s+mille)?|a\s+presto),?[ \t]*"
+        rf"(?:\r?\n[ \t]*){{1,2}}({_IT_NAME1})[ \t]*$"), "PERSON", 1, False,
+     ("saluti", "saluto", "cordialmente", "grazie", "a presto"), False),
+    ("it_date_of_birth", re.compile(
+        rf"(?i:\b(?:data\s+di\s+nascita|nat[oa](?:/[ao])?(?:\s+a\s+[^\n,;]{{1,40}}?)?\s+il))\b\"?\s*[:=]?\s*\"?({_DATE})"),
+     "DOB", 1, False, (re.compile(r"(?i)\bdata\s+di\s+nascita|\bnat[oa]\b"),), True),
+    ("it_labelled_id", re.compile(
+        r"(?i:\b(?:carta\s+d['’]identit[aà]|patente(?:\s+di\s+guida)?|tessera\s+sanitaria|passaporto|numero\s+documento|matricola|"
+        r"polizza))\b" + _IT_ID_SEP + _ID_VALUE), "ID", 1, True,
+     ("carta", "patente", "tessera", "passaporto", "numero", "matricola", "polizza"), True),
+    ("it_labelled_account", re.compile(
+        r"(?i:\b(?:conto\s+corrente|c/c|numero\s+conto|carta\s+di\s+credito|bancomat))\b" + _IT_ID_SEP + _ID_VALUE), "ACCOUNT", 1, True,
+     ("conto", "c/c", "numero", "carta", "bancomat"), True),
+    ("it_phone_prefixed", re.compile(r"(?<![\d+.-])(?:\+|00)39[ .-]?\d(?:[ .-]?\d){5,11}(?![\d.-])"), "PHONE", 0, False,
+     ("+39", "0039"), True),
+    ("it_phone_labelled", re.compile(
+        r"(?i:\b(?:telefono|tel|cellulare|cell|fax|whatsapp|recapito(?:\s+telefonico)?))\b\.?\"?\s*[:=]?\s*\"?"
+        r"((?:\+39[ .-]?)?\d(?:[ ./-]?\d){5,11})(?![\d.-])"), "PHONE", 1, False,
+     ("tel", "cell", "fax", "whatsapp", "recapito"), True),
+    ("it_mobile", re.compile(r"(?<![\d.+-])3\d{2}(?:[ .-]\d{6,7}|[ .-]\d{3}[ .-]\d{3,4})(?![\d.-])"), "PHONE", 0, False, (), False),
 ]
+
+_CF_ODD = dict(zip("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                   (1, 0, 5, 7, 9, 13, 15, 17, 19, 21, 1, 0, 5, 7, 9, 13, 15, 17, 19, 21, 2, 4, 18, 20, 11, 3, 6, 8, 12, 14, 16, 10,
+                    22, 25, 24, 23)))
+
+
+def codice_fiscale_ok(value: str) -> bool:
+    """The check character of a 16-character codice fiscale, homocodes included. Same job as ``luhn_ok``:
+    sixteen letters and digits in the right places are common in hashes and ids, a valid check character is not."""
+    v = value.upper()
+    if len(v) != 16 or not v.isascii() or not v.isalnum():
+        return False
+    total = sum(_CF_ODD[c] if i % 2 == 0 else (int(c) if c.isdigit() else ord(c) - 65) for i, c in enumerate(v[:15]))
+    return chr(65 + total % 26) == v[15]
+
+
+_IDENTITY_CHECKS = {"codice_fiscale": codice_fiscale_ok}
 
 _ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 _WINDOW_BEFORE, _WINDOW_AFTER = 120, 220  # longest lead before a trigger · label + separator + longest value
@@ -303,6 +392,8 @@ def identity_spans(text: str) -> list[tuple[int, int, str, str]]:
             if grp != 0 and _is_reference(value):
                 continue
             if needs_digit and not any(c.isdigit() for c in value):
+                continue
+            if _name in _IDENTITY_CHECKS and not _IDENTITY_CHECKS[_name](value):
                 continue
             seen.add((m.start(grp), m.end(grp)))
             out.append((m.start(grp), m.end(grp), kind, value))
@@ -800,7 +891,7 @@ class Scrubber:
                 value = m.group(grp)
                 if grp != 0 and _is_reference(value):
                     continue
-                if name == "assignment_prose" and not _looks_secret(value):
+                if name in ("assignment_prose", "assignment_prose_it") and not _looks_secret(value):
                     continue
                 spans.append((m.start(grp), m.end(grp), kind, value))
         if policy.fast:

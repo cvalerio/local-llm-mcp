@@ -4,6 +4,15 @@ All notable changes to local-llm-mcp. Dates are the day the change was pushed.
 
 ## Unreleased
 
+### Added — Italian private data has its own shapes
+- The identity layer now recognises the codice fiscale (homocodes included, check character verified), labelled partita IVA,
+  street addresses with a civic number (`Via Roma 12, 00184 Roma`), `CAP Città (PR)`, Italian titles (`Sig.ra`, `Dott.`; the
+  short ones only with their dot, so `Arch Linux` stays readable), labelled names, mail headers, greetings, sign-offs, dates
+  of birth, labelled documents and accounts, and `+39`, labelled or separated mobile phone numbers. An unlabelled run of
+  ten digits is left alone: it cannot be told from an id or a timestamp.
+- Prose secrets in Italian are masked in both modes (`la password è ...`, `il token è abcd1234`).
+- In ASSIST mode the disclosure dialog now also fires on the first Italian value found.
+
 ### Fixed — secrets, the allow list and the worker's route (security review)
 - **A slice no longer shows part of a secret.** `local_llm_artifact` and `verbatim=true` cut from the raw material and
   scrubbed afterwards, and a scrub cannot recognise a fragment: a slice starting inside a private key returned its body.

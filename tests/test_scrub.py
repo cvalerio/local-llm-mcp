@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from local_llm_mcp.config import load_env_file
-from local_llm_mcp.scrub import PLACEHOLDER_RE, Scrubber, Vault
+from local_llm_mcp.scrub import PLACEHOLDER_RE, Scrubber, Vault, codice_fiscale_ok
 
 
 @pytest.fixture
@@ -692,4 +692,79 @@ def test_keep_lines_leaves_the_line_count_alone(scrubber, vault):
 def test_a_long_capital_run_stays_fast(scrubber, vault):
     t0 = time.monotonic()
     scrubber.find_spans("KEY_" * 50_000, secrets_only=True)
+    assert time.monotonic() - t0 < 5
+
+
+# ---- Italian --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text, private", [
+    ("Codice fiscale: RSSMRA85T10A562S", "RSSMRA85T10A562S"),
+    ("cf rssmra85t10a562s nel modulo", "rssmra85t10a562s"),
+    ("P.IVA 01234567890", "01234567890"),
+    ("Partita IVA: IT01234567890", "01234567890"),
+    ("Indirizzo: Via Roma 12, 00184 Roma", "Via Roma 12"),
+    ("Indirizzo: Via Roma 12, 00184 Roma", "00184 Roma"),
+    ("abita in via XX Settembre 5/B", "XX Settembre 5"),
+    ("in Piazza dell'Unità d'Italia, 3", "Unità"),
+    ("Corso Vittorio Emanuele n. 21", "Vittorio Emanuele"),
+    ("spedire a 20121 Milano (MI)", "20121 Milano"),
+    ("Sig. Mario Rossi", "Mario Rossi"),
+    ("la Sig.ra Niccolò De Luca", "Niccolò De Luca"),
+    ("Dott.ssa Anna Bianchi", "Anna Bianchi"),
+    ("Avv. Carlo Verdi", "Carlo Verdi"),
+    ("Nome: Mario Rossi", "Mario Rossi"),
+    ("Cognome: Rossi", "Rossi"),
+    ("Nome e cognome: Anna Bianchi", "Anna Bianchi"),
+    ("Intestatario: Anna Bianchi", "Anna Bianchi"),
+    ("Da: Anna Bianchi <x@example.org>", "Anna Bianchi"),
+    ("Gentile Mario Rossi,", "Mario Rossi"),
+    ("Ciao Mario,\ncome va?", "Mario"),
+    ("Cordiali saluti,\nAnna Bianchi\n", "Anna Bianchi"),
+    ("Data di nascita: 10/12/1985", "10/12/1985"),
+    ("nato a Reggio Emilia il 3 marzo 1985", "3 marzo 1985"),
+    ("Patente n. U1A2B3C4D", "U1A2B3C4D"),
+    ("Carta d'identità: CA12345AB", "CA12345AB"),
+    ("conto corrente 000123456789", "000123456789"),
+    ("+39 333 1234567", "333 1234567"),
+    ("Telefono: 06 1234567", "06 1234567"),
+    ("cell. 3331234567", "3331234567"),
+    ("chiamami al 333 1234567", "333 1234567"),
+])
+def test_italian_private_data_is_masked(scrubber, vault, text, private):
+    assert private not in scrubber.scrub(text, vault).text
+
+
+@pytest.mark.parametrize("text", [
+    "RSSMRA85T10A562X", "via HTTP 200", "accesso via SSH 22", "via CLI 2", "arrivato via email", "installato su Arch Linux", "una Rag Pipeline",
+    "Buongiorno a tutti,", "Gentile Cliente,", "il token è scaduto", "la password è sbagliata", "numero 3331234567 in coda",
+    "2026-09-08T21:10:11 host systemd[1]: pid 3345 rc=0 bytes=1234567", "nato il giorno prima", "il corso di Python",
+])
+def test_italian_lookalikes_stay_readable(scrubber, vault, text):
+    assert scrubber.scrub(text, vault).text == text
+
+
+def test_a_codice_fiscale_homocode_is_checked_and_masked(scrubber, vault):
+    body = "RSSMRA85T10A56N"  # the 2 of A562 replaced by its homocode letter
+    good = next(body + c for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if codice_fiscale_ok(body + c))
+    assert good not in scrubber.scrub(good, vault).text
+
+
+@pytest.mark.parametrize("text, secret", [
+    ("la password è hunter2value", "hunter2value"), ("il token è abcd1234", "abcd1234"), ("la parola d'ordine era Pippo-99", "Pippo-99"),
+    ("il PIN è 4821", "4821"),
+])
+def test_italian_prose_secrets_are_masked_in_assist_too(scrubber, vault, text, secret):
+    assert secret not in scrubber.scrub(text, vault, secrets_only=True).text
+
+
+def test_italian_identity_shapes_follow_the_switch_and_the_policy(terms, vault):
+    text = "Sig. Mario Rossi, Codice fiscale RSSMRA85T10A562S"
+    assert Scrubber(None, terms, shapes=False).scrub(text, vault).text == text
+    assert Scrubber(None, terms).scrub(text, vault, secrets_only=True).text == text
+
+
+@pytest.mark.parametrize("shape", ["Via " * 40_000, "Via Roma " * 20_000, "A" * 160_000, "nato a " * 25_000, "Sig. " * 30_000, "333 " * 40_000])
+def test_italian_shapes_stay_fast_on_hostile_text(scrubber, shape):
+    t0 = time.monotonic()
+    scrubber.find_spans(shape)
     assert time.monotonic() - t0 < 5
