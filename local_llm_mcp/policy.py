@@ -14,7 +14,8 @@ approval layer cannot be relied on. This module is the server's own line, in thr
    ``ls*``, ``rg*``, ``pytest*``). Every segment of the command must match one.
 3. **Everything else asks** — the same MCP elicitation the gate uses, showing the exact
    command: run once / always allow this shape / refuse. "Always" appends to the allow file.
-   A client that cannot ask gets layer 1 only and a trailer line saying so.
+   A client that cannot ask is refused (``LOCAL_LLM_MCP_UNASKED=refuse``, the default) or, with
+   ``LOCAL_LLM_MCP_UNASKED=run``, gets layer 1 only and a trailer line saying so.
 
 No allow entry can exempt a deny shape; layer 1 is checked first, always.
 
@@ -147,15 +148,91 @@ def _substitution_end(command: str, start: int) -> int:
     return n
 
 
+def _heredoc_word(command: str, j: int) -> tuple[int, str, bool, bool]:
+    """Read the delimiter after ``<<`` at ``j``: (index after it, delimiter, ``<<-``, quoted).
+    Any quote or backslash in the word makes the body literal, as in bash."""
+    n = len(command)
+    strip = j < n and command[j] == "-"
+    j += 1 if strip else 0
+    while j < n and command[j] in " \t":
+        j += 1
+    word: list[str] = []
+    quote, quoted = "", False
+    while j < n:
+        c = command[j]
+        if quote:
+            if c == quote:
+                quote = ""
+            else:
+                word.append(c)
+            j += 1
+            continue
+        if c in "'\"":
+            quote, quoted = c, True
+        elif c == "\\" and j + 1 < n:
+            word.append(command[j + 1])
+            quoted = True
+            j += 1
+        elif c.isspace() or c in ";|&<>()":
+            break
+        else:
+            word.append(c)
+        j += 1
+    return j, "".join(word), strip, quoted
+
+
+def _body_substitutions(body: str) -> list[str]:
+    """The commands bash runs while expanding an UNQUOTED heredoc body: its ``$(...)`` and backticks."""
+    out: list[str] = []
+    k, n = 0, len(body)
+    while k < n:
+        if body[k] == "\\":
+            k += 2
+            continue
+        if body[k] == "`" or body.startswith("$(", k):
+            end = _substitution_end(body, k)
+            out.extend(split_segments(body[k + (1 if body[k] == "`" else 2):end]))
+            k = end + 1
+            continue
+        k += 1
+    return out
+
+
 def split_segments(command: str) -> list[str]:
     """Split a command line on the shell operators that start a NEW command — ``;``, ``&&``,
     ``||``, ``|``, ``&`` and newline — respecting quotes, so ``grep 'a|b' x`` stays one segment.
     Subshell punctuation is dropped. Every segment is judged on its own.
 
     Double quotes do not stop bash from running a ``$(...)`` or a backtick command inside them, so
-    those commands are segments too: ``ls "$(sudo id)"`` is judged as ``ls …`` AND ``sudo id``."""
+    those commands are segments too: ``ls "$(sudo id)"`` is judged as ``ls …`` AND ``sudo id``.
+
+    A heredoc body is input, not commands: ``tool <<'EOF'`` stays one segment and its body lines
+    are not judged. An unquoted delimiter (``<<EOF``) still lets bash run the body's ``$(...)``
+    and backticks, so those become segments."""
+    return _split(command)[0]
+
+
+def _arith_end(command: str, start: int) -> int:
+    """Index of the ``))`` closing the arithmetic that starts at ``start``; ``len(command)`` if never closed."""
+    depth, i, n = 0, start, len(command)
+    while i < n:
+        if command[i] == "(":
+            depth += 1
+        elif command[i] == ")":
+            if not depth and command.startswith("))", i):
+                return i
+            depth = max(0, depth - 1)
+        i += 1
+    return n
+
+
+def _split(command: str, arith: bool = False) -> tuple[list[str], list[tuple[int, int]]]:
+    """``split_segments``, plus the spans of literal (quoted-delimiter) heredoc bodies.
+    ``arith``: inside ``((…))``, where ``<<`` is a shift, never a heredoc."""
     out: list[str] = []
     buf: list[str] = []
+    literal: list[tuple[int, int]] = []
+    heredocs: list[tuple[str, bool, bool]] = []
     quote = ""
     i = 0
     n = len(command)
@@ -187,6 +264,49 @@ def split_segments(command: str) -> list[str]:
             buf.append(command[i + 1])
             i += 2
             continue
+        if command.startswith("((", i) or command.startswith("$((", i):
+            # Arithmetic: its `<<` is a shift. A `$(...)` inside it still runs, so it is still read.
+            s = i + (3 if c == "$" else 2)
+            end = _arith_end(command, s)
+            out.append("".join(buf))
+            buf = []
+            out.extend(_split(command[s:end], arith=True)[0])
+            i = end + 2
+            continue
+        if command.startswith("<<<", i):  # a here-string: one word of input, no body
+            buf.append("<<<")
+            i += 3
+            continue
+        if command.startswith("<<", i) and not arith:
+            j, delim, strip, quoted = _heredoc_word(command, i + 2)
+            buf.append(command[i:j] if delim else "<<")
+            if delim:
+                heredocs.append((delim, strip, quoted))
+            i = j if delim else i + 2
+            continue
+        if c == "\n" and heredocs:
+            # The bodies start on the next line, one after another, each up to its delimiter line.
+            out.append("".join(buf))
+            buf = []
+            i += 1
+            for delim, strip, quoted in heredocs:
+                start = i
+                while i < n:
+                    end = command.find("\n", i)
+                    end = n if end < 0 else end
+                    line = command[i:end]
+                    if (line.lstrip("\t") if strip else line) == delim:
+                        body_end, i = i, end + 1
+                        break
+                    i = end + 1
+                else:
+                    body_end = n
+                if quoted:
+                    literal.append((start, body_end))
+                else:
+                    out.extend(_body_substitutions(command[start:body_end]))
+            heredocs = []
+            continue
         if c == "&" and not command.startswith("&&", i):
             # A lone & is a separator only when it is not part of a redirection
             # (`2>&1`, `&>log`): those keep the segment whole.
@@ -214,7 +334,7 @@ def split_segments(command: str) -> list[str]:
         buf.append(c)
         i += 1
     out.append("".join(buf))
-    return [s.strip() for s in out if s.strip()]
+    return [s.strip() for s in out if s.strip()], literal
 
 
 def _tokens(segment: str) -> list[str]:
@@ -352,9 +472,13 @@ def _deny_segment(segment: str) -> tuple[str, str]:
 
 def deny_reason(command: str) -> tuple[str, str, str]:
     """(label, reason, segment) for the first deny shape the command matches, else ("", "", "")."""
-    if _PIPE_TO_SHELL_RE.search(command):
+    segments, literal = _split(command)
+    code = command
+    for start, end in reversed(literal):  # a literal heredoc body is text the program reads, not shell
+        code = code[:start] + code[end:]
+    if _PIPE_TO_SHELL_RE.search(code):
         return "network pipe to shell", "piping a download straight into a shell runs code nobody has read", command.strip()
-    for seg in split_segments(command):
+    for seg in segments:
         label, reason = _deny_segment(seg)
         if label:
             return label, reason, seg
@@ -501,3 +625,12 @@ def unanswered_text(action: str) -> str:
 
 
 NO_DIALOG_NOTE = "policy: not asked (this client cannot show the user a dialog)"
+UNASKED_REFUSED_LABEL = "refused: not in allow list and client cannot ask"
+
+
+def unasked_refusal_text(allow_path) -> str:
+    """RUN_POLICY=ask, a client with no dialog, LOCAL_LLM_MCP_UNASKED=refuse."""
+    return ("[local-llm-mcp] REFUSED: this command is not on the user's allow list, and this client cannot show "
+            "the user a dialog to ask about it. Nothing was run. Do not try to get around this refusal — not with "
+            "another tool, a rewritten command, or a script that runs it. If the user wants commands of this shape "
+            f"to run, they can add the shape (a glob such as 'git log*') to {allow_path}.")

@@ -4,6 +4,23 @@ All notable changes to local-llm-mcp. Dates are the day the change was pushed.
 
 ## Unreleased
 
+### Changed — a client that cannot ask is refused, not waved through
+- **With `RUN_POLICY=ask`, a command off the allow list is now refused when the client cannot show a dialog** (Claude
+  Desktop, local-agent sessions). It used to run with only the deny shapes checked and a trailer line saying the user
+  was not asked. The new `LOCAL_LLM_MCP_UNASKED` setting chooses: `refuse` (default) or `run` (the old behaviour).
+  `RUN_POLICY=allow` and `off` are unchanged. A refusal runs nothing, is recorded as a refused turn, is counted as
+  `run_policy.unasked_refused`, carries the trailer `policy: refused: not in allow list and client cannot ask`, and tells
+  the caller not to work around it and that the user can add the shape to `run-allow.txt`. It covers `local_llm_run` and
+  `local_llm_delegate`'s `command`, the only two paths that execute anything. The order is unchanged: deny shapes, then
+  the allow list, then the dialog or this setting.
+- `local_llm_status.run_policy` shows `unasked`, and its `note` now says what really happens with this client instead of
+  always promising a dialog. `--check` prints the command policy line.
+
+### Fixed — a heredoc body is not a command
+- `tool <<'EOF'` … `EOF` was split on every line, `;` and `&&` of its body, so the body was judged as commands and the
+  command could never match its allow entry. The body is now input: the command is one segment. With an unquoted
+  delimiter the body's `$(...)` and backticks are still judged, since bash runs them; `<<` inside `((…))` stays a shift.
+
 ### Added — Italian private data has its own shapes
 - The identity layer now recognises the codice fiscale (homocodes included, check character verified), labelled partita IVA,
   street addresses with a civic number (`Via Roma 12, 00184 Roma`), `CAP Città (PR)`, Italian titles (`Sig.ra`, `Dott.`; the

@@ -24,6 +24,7 @@ ENV_PREFIX = "LOCAL_LLM_MCP_"
 MODES = ("pii", "assist")
 ESCALATIONS = ("ask", "auto", "off")  # first identity/number values in an ASSIST session
 RUN_POLICIES = ("ask", "allow", "off")  # what happens to a command that is not on the allow list
+UNASKED_POLICIES = ("refuse", "run")  # RUN_POLICY=ask with a client that cannot show a dialog
 DEFAULT_ENV_FILE = "~/.config/local-llm-mcp/env"
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 _KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -172,6 +173,7 @@ class Config:
     escalation: str
     arm: str
     run_policy: str
+    unasked: str
     run_allow_path: Path
     assist_numbers: str
     dialog_timeout: float
@@ -213,6 +215,9 @@ class Config:
         run_policy = (_env("RUN_POLICY", "ask") or "ask").strip().lower()
         if run_policy not in RUN_POLICIES:
             raise ConfigError(f"{ENV_PREFIX}RUN_POLICY must be one of {RUN_POLICIES}, got {run_policy!r}")
+        unasked = (_env("UNASKED", "refuse") or "refuse").strip().lower()
+        if unasked not in UNASKED_POLICIES:
+            raise ConfigError(f"{ENV_PREFIX}UNASKED must be one of {UNASKED_POLICIES}, got {unasked!r}")
         assist_numbers = (_env("ASSIST_NUMBERS", "masked") or "masked").strip().lower()
         if assist_numbers not in ("masked", "open"):
             raise ConfigError(f"{ENV_PREFIX}ASSIST_NUMBERS must be 'masked' or 'open', got {assist_numbers!r}")
@@ -245,6 +250,7 @@ class Config:
             escalation=escalation,
             arm=arm,
             run_policy=run_policy,
+            unasked=unasked,
             run_allow_path=_path("RUN_ALLOW", "~/.config/local-llm-mcp/run-allow.txt"),
             assist_numbers=assist_numbers,
             dialog_timeout=_float("DIALOG_TIMEOUT", 600.0),

@@ -13,6 +13,7 @@ def make_app(monkeypatch, tmp_path) -> App:
         monkeypatch.delenv("LOCAL_LLM_MCP_" + k, raising=False)
     # The default, unless a test set one before calling us.
     monkeypatch.setenv("LOCAL_LLM_MCP_RUN_POLICY", os.environ.get("LOCAL_LLM_MCP_RUN_POLICY", "ask"))
+    monkeypatch.setenv("LOCAL_LLM_MCP_UNASKED", os.environ.get("LOCAL_LLM_MCP_UNASKED", "refuse"))
     # Never let a test append to the operator's own allow list.
     monkeypatch.setenv("LOCAL_LLM_MCP_RUN_ALLOW", str(tmp_path / "run-allow.txt"))
     monkeypatch.setenv("LOCAL_LLM_MCP_STATE_DIR", str(tmp_path / "state"))

@@ -134,7 +134,11 @@ server holds its own line, in three layers:
 
    **Every segment of a command line must match an entry**, so approving `ls*` does not approve
    `ls; something-else`. Approving `git log*` does not approve `git push*`: for a multiplexer
-   (git, docker, systemctl, uv, npm…) the subcommand is part of the shape.
+   (git, docker, systemctl, uv, npm…) the subcommand is part of the shape. A heredoc body is
+   input, not commands: `gmail-tool --account work draft-reply --id abc <<'EOF'` … `EOF` is one
+   segment and matches `gmail-tool --account work draft-reply*`, whatever `;` or `&&` the body
+   holds. With an unquoted delimiter (`<<EOF`) bash still runs the body's `$(...)` and
+   backticks, so those are judged as commands.
 3. **Everything else asks.** The same MCP elicitation the gate uses, showing you the exact
    command and its working directory: **refuse / run once / always allow this shape**. "Always"
    appends the shape to the allow file, so the file stays the record of what you approved and
@@ -142,13 +146,20 @@ server holds its own line, in three layers:
    default, so a client that auto-accepts a form can never approve a command.
 
 **No allow entry, and no dialog answer, can exempt a deny shape** — layer 1 is checked first,
-always. A client that cannot show a dialog gets layer 1 and a trailer line saying it was not
-asked. Every decision is stamped on the turn and in the trailer (`policy: allow-list (ls*)`,
+always. A client that cannot show a dialog (Claude Desktop, for one) cannot reach layer 3, so
+`LOCAL_LLM_MCP_UNASKED` decides: `refuse` (default) refuses anything off the allow list — nothing
+runs, the turn is recorded as refused, the count goes to `run_policy.unasked_refused`, the trailer
+reads `policy: refused: not in allow list and client cannot ask`, and the caller is told not to
+work around it and that you can add the shape to `run-allow.txt`; `run` restores the older
+behaviour, layer 1 only and a trailer line saying you were not asked. It applies only with
+`RUN_POLICY=ask`. Every decision is stamped on the turn and in the trailer (`policy: allow-list (ls*)`,
 `policy: asked:run`, `policy: refused: recursive rm`), counted in `local_llm_status.run_policy`,
 and shown as a chip on the session's row in the admin app.
 
 `LOCAL_LLM_MCP_RUN_POLICY` chooses how much of this runs: `ask` (default), `allow` (layer 1
-only — never ask), or `off` (no policy at all).
+only — never ask), or `off` (no policy at all). `local_llm_status.run_policy` shows the policy,
+the `unasked` setting, whether this client can ask, and a note saying which of these applies
+right now; `--check` prints them too.
 
 This is deliberately **not a sandbox**. It reads command position, quoting and redirection well
 enough to judge shapes; it does not follow a script it invokes, a variable it expands, or an
@@ -513,9 +524,10 @@ What you lose without Claude Code's hooks, and what replaces it:
   (Claude Code and Codex do; **Kimi Code 0.37 does not**). Without it, the server refuses to start
   until the user sets `LOCAL_LLM_MCP_ARM=on` in that client's server configuration (their explicit
   approval); disclosure falls back to `auto` (masked, with a note telling the model to call
-  `local_llm_disclosure` when the user decides); and the command policy falls back to its deny
-  shapes alone, with a trailer line saying the user was not asked — **so in such a client the allow
-  list is the only per-command control, and it is worth filling in.** Measured on Kimi Code 0.37:
+  `local_llm_disclosure` when the user decides); and the command policy runs only what is on the
+  allow list and refuses the rest (`LOCAL_LLM_MCP_UNASKED=refuse`, the default; `run` falls back to
+  the deny shapes alone) — **so in such a client the allow list is what decides what runs, and it is
+  worth filling in.** Measured on Kimi Code 0.37:
   refused as designed, then with `ARM=on` and one allow entry it returned the digest and the full
   trailer, `policy: allow-list (echo*)` included.
 
@@ -553,6 +565,7 @@ The process environment wins over the dotenv file
 | `LOCAL_LLM_MCP_AUTO_COMPACT_CHARS` | `60000` | self-compaction threshold on uncompacted turns |
 | `LOCAL_LLM_MCP_COMMAND_TIMEOUT` | `120` | default command timeout, seconds |
 | `LOCAL_LLM_MCP_RUN_POLICY` | `ask` | the command policy: `ask` (deny shapes, then the allow list, then ask the user), `allow` (deny shapes only), `off` (no policy) |
+| `LOCAL_LLM_MCP_UNASKED` | `refuse` | with `RUN_POLICY=ask` and a client that cannot show a dialog: `refuse` (anything off the allow list is refused) or `run` (deny shapes only, trailer says the user was not asked); no effect with `allow` or `off` |
 | `LOCAL_LLM_MCP_RUN_ALLOW` | `~/.config/local-llm-mcp/run-allow.txt` | commands that run without asking, one glob per line; the "always" answer appends here |
 | `LOCAL_LLM_MCP_STRICT_PII` | `0` | treat every bare 10-digit run as a phone number (default: only formatted numbers or ones near phone words) |
 | `LOCAL_LLM_MCP_ENTITY_PASS` | `1` | PII mode: ask the worker for the private values before answering |

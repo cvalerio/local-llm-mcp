@@ -57,6 +57,10 @@ def _check(cfg: Config) -> int:
     print(f"prices: {len(prices.models)} models (checked {prices.doc.get('checked')}, {prices.age_days()} days old"
           f"{', STALE' if prices.stale() else ''}), headline {prices.caller_model() or '-'}, "
           f"override {'present' if prices.override_present else 'absent'} at {cfg.prices_path}", file=sys.stderr)
+    print(f"command policy: RUN_POLICY={cfg.run_policy}, UNASKED={cfg.unasked} "
+          f"({'a client without a dialog is refused anything off the allow list' if cfg.unasked == 'refuse' else 'a client without a dialog runs anything not denied'}"
+          f"{'' if cfg.run_policy == 'ask' else '; applies only with RUN_POLICY=ask'}), allow list {cfg.run_allow_path}",
+          file=sys.stderr)
     s = Session(cfg)
     print(f"session: key={s.key} claude_pid={s.claude_pid} dir={s.dir}", file=sys.stderr)
 

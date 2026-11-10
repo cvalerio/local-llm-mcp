@@ -244,14 +244,15 @@ class Session:
         the shape and the command (this vault is local and 0600); an approval keeps counts only."""
         rec = dict(self.meta.get("run_policy") or {}) if isinstance(self.meta.get("run_policy"), dict) else {}
         rec[verdict] = int(rec.get(verdict) or 0) + 1
-        if verdict in ("denied", "refused"):
+        if verdict in ("denied", "refused", "unasked_refused"):
             rec["last_refusal"] = {"ts": _now_iso(), "rule": rule, "command": command[:300]}
         self.meta["run_policy"] = rec
         self._save_meta()
 
     def run_policy(self) -> dict:
         rec = self.meta.get("run_policy") if isinstance(self.meta.get("run_policy"), dict) else {}
-        out = {k: int(rec.get(k) or 0) for k in ("allowed", "asked_once", "asked_always", "refused", "denied", "unasked")}
+        out = {k: int(rec.get(k) or 0) for k in ("allowed", "asked_once", "asked_always", "refused", "denied", "unasked",
+                                                      "unasked_refused")}
         out["last_refusal"] = rec.get("last_refusal")
         return out
 

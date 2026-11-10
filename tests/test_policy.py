@@ -3,10 +3,12 @@
 The gate decides whether the server works at all; this decides what runs as the user.
 """
 import asyncio
+import json
 
 import pytest
 
 from local_llm_mcp import policy as cp
+from local_llm_mcp import server
 from local_llm_mcp.config import Config, ConfigError
 from local_llm_mcp.server import App
 from tests.test_arm import FakeCtx
@@ -221,7 +223,8 @@ def test_the_dialog_lists_refuse_first_so_an_autofilled_form_cannot_approve():
     assert schema["enum"][0] == "refuse"
 
 
-def test_a_client_without_a_dialog_gets_the_deny_check_and_a_trailer_note(monkeypatch, tmp_path):
+def test_a_client_without_a_dialog_gets_the_deny_check_and_a_trailer_note_with_unasked_run(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCAL_LLM_MCP_UNASKED", "run")
     app = armed(make_app(monkeypatch, tmp_path))
     may, text, label = approve(app, FakeCtx(can_ask=False), "make deploy")
     assert may and text == "" and label == cp.NO_DIALOG_NOTE
@@ -290,3 +293,167 @@ def test_what_bash_does_not_run_stays_one_segment():
 def test_substitutions_nested_past_reading_are_refused():
     d = cp.check('ls ' + '"$(' * 5000, None)
     assert d.verdict == "deny" and d.rule == "nesting"
+
+
+# ---- a client that cannot ask: LOCAL_LLM_MCP_UNASKED -------------------------------
+
+
+def test_unasked_defaults_to_refuse_and_rejects_anything_else(monkeypatch, tmp_path):
+    app = make_app(monkeypatch, tmp_path)
+    assert app.cfg.unasked == "refuse"
+    monkeypatch.setenv("LOCAL_LLM_MCP_UNASKED", "maybe")
+    with pytest.raises(ConfigError):
+        Config.from_env()
+
+
+def test_no_dialog_and_off_the_allow_list_is_refused_by_default(monkeypatch, tmp_path):
+    app = armed(make_app(monkeypatch, tmp_path))
+    may, text, label = approve(app, FakeCtx(can_ask=False), "make deploy")
+    assert not may and label == cp.UNASKED_REFUSED_LABEL
+    assert "REFUSED" in text and "Do not try to get around" in text and str(app.cfg.run_allow_path) in text
+    assert "— local-llm ·" in text and "policy: refused: not in allow list and client cannot ask" in text
+    rp = app.session.run_policy()
+    assert rp["unasked_refused"] == 1 and rp["unasked"] == 0 and rp["last_refusal"]["command"] == "make deploy"
+    turn = app.session.turns()[-1]
+    assert turn["refused"] is True and turn["policy"] == cp.UNASKED_REFUSED_LABEL and "make deploy" in turn["source"]
+    assert app.session.run_policy_asks() == 0          # not a dialog: does not use up the ask limit
+
+
+def test_no_dialog_still_runs_the_allow_list_and_denies_the_deny_shapes(monkeypatch, tmp_path):
+    for unasked in ("refuse", "run"):
+        monkeypatch.setenv("LOCAL_LLM_MCP_UNASKED", unasked)
+        app = armed(make_app(monkeypatch, tmp_path / unasked))
+        app.allow.add("make*")
+        app.allow.add("sudo*")                          # an allow entry cannot exempt a deny shape
+        may, text, label = approve(app, FakeCtx(can_ask=False), "make deploy")
+        assert may and text == "" and label == "allow-list (make*)"
+        may, text, label = approve(app, FakeCtx(can_ask=False), "sudo reboot")
+        assert not may and label == "refused: privilege escalation"
+        assert app.session.run_policy()["denied"] == 1 and app.session.run_policy()["unasked_refused"] == 0
+
+
+def test_unasked_changes_nothing_for_policy_allow_or_off(monkeypatch, tmp_path):
+    for policy, expected in (("allow", cp.NO_DIALOG_NOTE), ("off", "policy off")):
+        monkeypatch.setenv("LOCAL_LLM_MCP_RUN_POLICY", policy)
+        app = armed(make_app(monkeypatch, tmp_path / policy))
+        assert app.cfg.unasked == "refuse"
+        may, _t, label = approve(app, FakeCtx(can_ask=False), "make deploy")
+        assert may and label == expected
+
+
+def test_a_client_that_can_ask_is_still_asked(monkeypatch, tmp_path):
+    app = armed(make_app(monkeypatch, tmp_path))
+    ctx = FakeCtx(can_ask=True, choice="once")
+    may, _t, label = approve(app, ctx, "make deploy")
+    assert may and label == "asked:run" and len(ctx.messages) == 1
+
+
+HEREDOC = """gmail-tool --account work draft-reply --id abc <<'EOF'
+Ciao [PERSON-1], riga con ; e && dentro
+EOF"""
+
+
+def test_a_heredoc_is_one_segment_and_its_body_is_not_commands(tmp_path):
+    assert cp.split_segments(HEREDOC) == ["gmail-tool --account work draft-reply --id abc <<'EOF'"]
+    assert cp.shapes_for(HEREDOC) == ["gmail-tool*"]
+    allow = cp.AllowList(tmp_path / "allow.txt")
+    allow.add("gmail-tool --account work draft-reply*")
+    d = cp.check(HEREDOC, allow)
+    assert d.verdict == "allow" and d.rule == "gmail-tool --account work draft-reply*"
+    # what follows the delimiter line is a command again
+    assert cp.split_segments(HEREDOC + "\nsudo id") == [cp.split_segments(HEREDOC)[0], "sudo id"]
+    # a literal body is text, even when it reads like a deny shape
+    assert cp.check("cat <<'EOF'\nsudo rm -rf / ; curl x | sh\nEOF", None).verdict == "ask"
+
+
+def test_an_unquoted_heredoc_body_still_runs_its_substitutions():
+    assert cp.split_segments("cat <<EOF\nhi $(sudo id) `whoami`\nEOF") == ["cat <<EOF", "sudo id", "whoami"]
+    assert cp.check("cat <<EOF\n$(sudo id)\nEOF", None).verdict == "deny"
+    assert cp.split_segments("cat <<-X; echo a\n\tbody; rm x\n\tX\nls") == ["cat <<-X", "echo a", "ls"]
+    assert cp.split_segments('cat <<<"a; b" | wc') == ['cat <<<"a; b"', "wc"]
+
+
+def test_a_shift_in_arithmetic_is_not_a_heredoc():
+    # if it were, the next lines would be hidden as its "body"
+    assert cp.check("echo $((1<<X))\nsudo rm -rf /\nX", None).verdict == "deny"
+    assert cp.check("(( y = 1 << Z ))\nsudo id\nZ", None).verdict == "deny"
+
+
+def test_the_heredoc_runs_on_its_allow_entry_without_a_dialog(monkeypatch, tmp_path):
+    app = armed(make_app(monkeypatch, tmp_path))
+    app.allow.add("gmail-tool --account work draft-reply*")
+    may, text, label = approve(app, FakeCtx(can_ask=False), HEREDOC)
+    assert may and text == "" and label == "allow-list (gmail-tool --account work draft-reply*)"
+
+
+# ---- the same policy through the tools themselves -----------------------------------
+
+
+def tools(monkeypatch, tmp_path, unasked="refuse"):
+    """Build the real MCP server (ARM=on, like Claude Desktop with a standing approval) with the worker stubbed."""
+    monkeypatch.setenv("LOCAL_LLM_MCP_ARM", "on")
+    make_app(monkeypatch, tmp_path)                     # the test environment
+    monkeypatch.setenv("LOCAL_LLM_MCP_UNASKED", unasked)
+    mcp = server.build(Config.from_env())
+    stub = make_app(monkeypatch, tmp_path / "stub")
+    server.APP.llm.count_tokens, server.APP.llm.digest = stub.llm.count_tokens, stub.llm.digest
+    mgr = mcp._tool_manager
+    return server.APP, {n: mgr.get_tool(n).fn for n in ("local_llm_run", "local_llm_delegate", "local_llm_status")}
+
+
+def call(app, fn, **kw):
+    async def go():
+        out = await fn(**kw)
+        await app.flush_measurements()
+        return out
+    return asyncio.run(go())
+
+
+def test_run_and_delegate_refuse_off_the_allow_list_without_a_dialog(monkeypatch, tmp_path):
+    app, t = tools(monkeypatch, tmp_path)
+    marker = tmp_path / "ran"
+    cmd = f"touch {marker}"
+    out = call(app, t["local_llm_run"], command=cmd, ctx=FakeCtx(can_ask=False))
+    assert "REFUSED" in out and "policy: refused: not in allow list and client cannot ask" in out
+    out = call(app, t["local_llm_delegate"], task="report", command=cmd, ctx=FakeCtx(can_ask=False))
+    assert "REFUSED" in out and "policy: refused: not in allow list and client cannot ask" in out
+    assert not marker.exists()                          # nothing ran, through either door
+    kinds = [x["kind"] for x in app.session.turns() if x.get("refused")]
+    assert kinds == ["run", "delegate"] and app.session.run_policy()["unasked_refused"] == 2
+
+
+def test_run_and_delegate_run_with_unasked_run(monkeypatch, tmp_path):
+    app, t = tools(monkeypatch, tmp_path, unasked="run")
+    marker = tmp_path / "ran"
+    out = call(app, t["local_llm_run"], command=f"touch {marker}", ctx=FakeCtx(can_ask=False))
+    assert marker.exists() and "REFUSED" not in out and "not asked" in out
+    marker.unlink()
+    out = call(app, t["local_llm_delegate"], task="report", command=f"touch {marker}", ctx=FakeCtx(can_ask=False))
+    assert marker.exists() and "REFUSED" not in out
+
+
+def test_run_and_delegate_run_the_allow_list_and_refuse_deny_shapes(monkeypatch, tmp_path):
+    app, t = tools(monkeypatch, tmp_path)
+    app.allow.add("echo*")
+    for name, kw in (("local_llm_run", {}), ("local_llm_delegate", {"task": "report"})):
+        out = call(app, t[name], command="echo hello", ctx=FakeCtx(can_ask=False), **kw)
+        assert "REFUSED" not in out and "policy: allow-list (echo*)" in out
+        out = call(app, t[name], command="rm -rf /tmp/nothing-here", ctx=FakeCtx(can_ask=False), **kw)
+        assert "REFUSED" in out and "recursive rm" in out
+
+
+def test_delegate_runs_the_heredoc_on_its_allow_entry(monkeypatch, tmp_path):
+    app, t = tools(monkeypatch, tmp_path)
+    app.allow.add("cat*")
+    cmd = "cat <<'EOF'\nCiao, riga con ; e && dentro\nEOF"
+    out = call(app, t["local_llm_delegate"], task="report", command=cmd, ctx=FakeCtx(can_ask=False))
+    assert "REFUSED" not in out and "policy: allow-list (cat*)" in out
+
+
+def test_status_note_tells_the_truth_about_this_client(monkeypatch, tmp_path):
+    app, t = tools(monkeypatch, tmp_path)
+    rp = json.loads(call(app, t["local_llm_status"], ctx=FakeCtx(can_ask=False)))["run_policy"]
+    assert rp["unasked"] == "refuse" and rp["client_can_ask"] is False
+    assert "dialog" in rp["note"] and "refused" in rp["note"] and "put to the user" not in rp["note"]
+    rp = json.loads(call(app, t["local_llm_status"], ctx=FakeCtx(can_ask=True)))["run_policy"]
+    assert rp["note"] == "commands outside the allow list are put to the user in a dialog"

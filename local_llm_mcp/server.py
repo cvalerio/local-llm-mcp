@@ -142,12 +142,14 @@ class App:
         return True, (f"[local-llm-mcp] The user turned this server on for this session (mode {self.mode.upper()}). "
                       "Operating rules:\n" + prompts.client_instructions(self.mode, self.cfg.model, self.cfg.base_url))
 
-    async def approve_command(self, ctx: Context | None, command: str, cwd: str = "") -> tuple[bool, str, str]:
+    async def approve_command(self, ctx: Context | None, command: str, cwd: str = "",
+                              kind: str = "run", task: str = "") -> tuple[bool, str, str]:
         """The command policy. Returns (may run, refusal to return instead, label for the turn).
 
         Deny shapes first and always — no allow entry and no dialog can exempt them. Then the
-        operator's allow list. Then the user is asked, showing the exact command; a client that
-        cannot ask gets the deny check only and a trailer line saying so.
+        operator's allow list. Then the user is asked, showing the exact command. A client that
+        cannot ask is refused (LOCAL_LLM_MCP_UNASKED=refuse, the default: the refusal is recorded
+        as a turn of ``kind``) or, with UNASKED=run, gets the deny check only and a trailer line.
         """
         if self.cfg.run_policy == "off":
             return True, "", "policy off"
@@ -161,6 +163,8 @@ class App:
         if d.verdict == "allow":
             self.session.note_run_policy("allowed", d.rule)
             return True, "", d.label
+        if not self.client_can_ask(ctx) and self.cfg.run_policy == "ask" and self.cfg.unasked == "refuse":
+            return False, self.refuse_unasked(command, kind, task), cp.UNASKED_REFUSED_LABEL
         if self.cfg.run_policy == "allow" or not self.client_can_ask(ctx):
             self.session.note_run_policy("unasked")
             return True, "", cp.NO_DIALOG_NOTE
@@ -198,6 +202,21 @@ class App:
         self.session.note_run_policy("asked_once")
         self.observer.event("execute_tool", "local_llm.policy", {"verdict": "once", "session": self.session.key})
         return True, "", "asked:run"
+
+    def refuse_unasked(self, command: str, kind: str, task: str) -> str:
+        """Nothing to ask with and the policy says refuse: count it, record the refused turn, and
+        return the refusal with its trailer."""
+        label = cp.UNASKED_REFUSED_LABEL
+        self.session.note_run_policy("unasked_refused", "not in allow list", command)
+        self.observer.event("execute_tool", "local_llm.policy",
+                            {"verdict": "unasked_refused", "rule": "not in allow list", "session": self.session.key})
+        text = cp.unasked_refusal_text(self.cfg.run_allow_path)
+        tid = self.session.append_turn({
+            "kind": kind, "mode": self.mode, "task": self.outbound(task).text[:2000],
+            "source": "command: " + self.outbound(command).text[:200], "excerpt": "", "verbatim": False,
+            "result": text, "ref": "", "raw_chars": 0, "out_chars": len(text), "secs": 0.0, "error": False,
+            "refused": True, "policy": label})
+        return text + self._trailer([self.mode, f"turn {tid}", f"policy: {label}"])
 
     def note_client(self, ctx: Context | None) -> None:
         """Remember which MCP client this session belongs to (name, version, whether it can show a dialog)."""
@@ -725,8 +744,9 @@ def build(cfg: Config) -> FastMCP:
             "of output belongs here, while commands that print little or nothing run directly. Placeholders in the "
             "command are expanded server-side before execution and never appear in the result — except a secret, "
             "which is never handed to a shell. The server holds its own command policy: destructive shapes are "
-            "refused outright, and anything outside the user's allow list is put to the user in a dialog, so a "
-            "refusal here is the user's or the server's answer and not something to work around."),
+            "refused outright, and anything outside the user's allow list is put to the user in a dialog (or, when "
+            "this client cannot show one, refused by default), so a refusal here is the user's or the server's "
+            "answer and not something to work around."),
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False),
     )
     async def local_llm_run(
@@ -742,7 +762,7 @@ def build(cfg: Config) -> FastMCP:
         on, note = await a.ensure_armed(ctx, "local_llm_run")
         if not on:
             return note
-        may, refusal, plabel = await a.approve_command(ctx, command, cwd)
+        may, refusal, plabel = await a.approve_command(ctx, command, cwd, kind="run", task=task)
         if not may:
             return (note + "\n\n" + refusal) if note else refusal
         try:
@@ -799,7 +819,7 @@ def build(cfg: Config) -> FastMCP:
         if command:
             # The same shell, so the same policy: a command reaching the worker through
             # delegate is not a way around the check local_llm_run makes.
-            may, refusal, plabel = await a.approve_command(ctx, command, cwd)
+            may, refusal, plabel = await a.approve_command(ctx, command, cwd, kind="delegate", task=task)
             if not may:
                 return (note + "\n\n" + refusal) if note else refusal
         pieces: list[str] = []
@@ -899,10 +919,15 @@ def build(cfg: Config) -> FastMCP:
                                 {"on": "turned on for this session", "off": "off for this session"}.get(armed_rec.get("state"),
                                  "off — nothing runs until the user turns it on (dialog, LOCAL_LLM_MCP_ARM=on, or the admin app)"))}
         a.allow.load()
-        st["run_policy"] = {**st.get("run_policy", {}), "policy": cfg.run_policy,
+        can_ask = App.client_can_ask(ctx)
+        st["run_policy"] = {**st.get("run_policy", {}), "policy": cfg.run_policy, "unasked": cfg.unasked,
                             "allow_file": str(cfg.run_allow_path), "allow_entries": list(a.allow.entries),
-                            "client_can_ask": App.client_can_ask(ctx),
-                            "note": {"ask": "commands outside the allow list are put to the user in a dialog",
+                            "client_can_ask": can_ask,
+                            "note": {"ask": ("commands outside the allow list are put to the user in a dialog" if can_ask else
+                                             "this client cannot show a dialog: commands outside the allow list are refused "
+                                             "(LOCAL_LLM_MCP_UNASKED=refuse)" if cfg.unasked == "refuse" else
+                                             "this client cannot show a dialog: commands outside the allow list run unasked, "
+                                             "deny shapes still refused (LOCAL_LLM_MCP_UNASKED=run)"),
                                      "allow": "deny shapes only; nothing else is asked about",
                                      "off": "no command policy — every command runs"}[cfg.run_policy]}
         st["disclosure"] = {**a.session.disclosure.to_meta(), "escalation": cfg.escalation,
