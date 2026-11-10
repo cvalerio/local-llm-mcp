@@ -332,9 +332,15 @@ def test_this_repository_history_is_clean(tmp_path):
     The denylist is deliberately absent: it lives outside the repository and differs
     per operator, so including it here would make this test pass on CI and fail on a machine whose list
     happens to be wider. The denylist proof is the hooks' job, on the machine that authors the commit.
+
+    The operator's git identity is absent for the same reason: the history holds every contributor's
+    commits, so comparing them with whoever runs the test fails on any clone but one author's. CI has no
+    identity and skips that check; checking the identity of a NEW commit is the hooks' job too.
     """
     env = {k: v for k, v in os.environ.items() if k != "LOCAL_LLM_MCP_DENYLIST"}
     env["XDG_CONFIG_HOME"] = str(tmp_path / "empty-config")  # unset, not mistyped: "no list", as CI runs
+    env["GIT_CONFIG_GLOBAL"] = os.devnull                     # no user.email, as CI runs
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
     r = subprocess.run([sys.executable, str(CHECK), "--all"], cwd=ROOT, env=env, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert "NO DENYLIST was found" in r.stdout  # and it says so, rather than reporting "clean"
